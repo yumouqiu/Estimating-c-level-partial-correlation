@@ -1,0 +1,357 @@
+library(lars)
+library(MASS)
+library(glasso)
+library(genlasso)
+library(scalreg)
+
+#---AR covariance structure---
+
+ARcov = function(p, rho){
+    Cov = matrix(0, p, p)
+    for (i in 1 : p){
+        for (j in 1 : p){
+            Cov[i, j] = rho^(abs(i - j))
+        }
+    }
+    return(Cov)
+}
+
+#---Block diagonal covariance structure---
+
+BD = function(p, k, tau2 = 1, rho){
+	# k is the number of blocks
+	C = matrix(0, p, p)
+	d = p / k
+	for (m in 1 : k){
+		for (i in ((m - 1) * d + 1) : (m * d)) {
+			for (j in ((m - 1) * d + 1) : (m * d)){
+				C[i, j] = rho
+			}	
+		}
+	}
+	Cov = C + diag(tau2 - rho, p)
+	return(Cov)
+}
+
+
+#---Block diagonal covariance structure 2---
+
+BD2 = function(p, k, tau2 = 1, rho){
+	# k is the number of blocks; rho is a vector, giving the lower and upper limits of the coefficients
+	C = matrix(0, p, p)
+	d = p / k
+	for (m in 1 : k){
+		rhotemp = runif(1, rho[1], rho[2])
+		for (i in ((m - 1) * d + 1) : (m * d)) {
+			for (j in ((m - 1) * d + 1) : (m * d)){
+				if (i == j) C[i, j] = tau2
+				else C[i, j] = rhotemp
+			}	
+		}
+	}
+	return(C)
+}
+
+
+#---Block diagonal covariance structure 3---
+
+BD3 = function(p, size, tau2 = 1, rho){
+	# k is the number of blocks; size is a vector, from which the size of each block is chosen; rho is a vector, from which the coefficients are random chosen
+	C = matrix(0, p, p)
+	m = 0
+	repeat {
+		sizetemp = sample(size, 1)
+		m = m + sizetemp
+		if (m < p){
+			rhotemp = sample(rho, 1)
+			for (i in (m - sizetemp + 1) : m) {
+				for (j in (m - sizetemp + 1) : m){
+					if (i == j) C[i, j] = tau2
+					else C[i, j] = rhotemp
+				}	
+			}
+		}
+		else {
+			m = m - sizetemp
+			rhotemp = sample(rho, 1)
+			for (i in (m + 1) : p) {
+				for (j in (m + 1) : p){
+					if (i == j) C[i, j] = tau2
+					else C[i, j] = rhotemp
+				}	
+			}
+			break
+		}
+	}
+	return(C)
+}
+
+
+#---Block banded (bandwidth 3) precision structure---
+
+block = function(p, k, tau2, rho, rho1){
+	# k is the number of blocks
+	C = matrix(0, p, p)
+	d = p / k
+	for (m in 1 : k){
+		for (i in ((m - 1) * d + 1) : (m * d)) {
+			for (j in ((m - 1) * d + 1) : (m * d)){
+				C[i, j] = rho
+			}	
+		}
+	}
+	for (m1 in 1 : (k - 1)){
+		m2 = m1 + 1
+		for (i in ((m1 - 1) * d + 1) : (m1 * d)) {
+			for (j in ((m2 - 1) * d + 1) : (m2 * d)){
+				C[i, j] = rho - 0.1
+			}	
+		}
+	}
+	for (m1 in 2 : k){
+		m2 = m1 - 1
+		for (i in ((m1 - 1) * d + 1) : (m1 * d)) {
+			for (j in ((m2 - 1) * d + 1) : (m2 * d)){
+				C[i, j] = rho
+			}	
+		}
+	}
+	Omega = C + diag(tau2 - rho, p)
+	return(Omega)
+}
+
+
+
+#---Block banded (bandwidth 3) precision structure 2 ---
+
+block2 = function(p, k, tau2 = 1, rho){
+	# k is the number of blocks
+	C = matrix(0, p, p)
+	d = p / k
+	for (m in 1 : k){
+		rhotemp = sample(rho, 1)
+		for (i in ((m - 1) * d + 1) : (m * d)) {
+			for (j in ((m - 1) * d + 1) : (m * d)){
+				if (i == j) C[i, j] = tau2
+				else C[i, j] = rhotemp
+			}	
+		}
+		if (m < k){
+			m2 = m + 1
+			for (i in ((m - 1) * d + 1) : (m * d)) {
+				for (j in ((m2 - 1) * d + 1) : (m2 * d)){
+					C[i, j] = (rhotemp - 0.1) * (rhotemp > 0) + (rhotemp + 0.1) * (rhotemp < 0)
+					C[j, i] = (rhotemp - 0.1) * (rhotemp > 0) + (rhotemp + 0.1) * (rhotemp < 0)
+				}	
+			}
+		}
+	}
+	return(C)
+}
+
+QS = function(u){
+if (u == 0) ker = 1
+else ker = 25 * ( sin(6 * pi * u / 5) / (6 * pi * u / 5) - cos(6 * pi * u / 5) ) / (12 * pi^2 * u^2)
+return(ker)
+}
+
+
+#--------------------------------------------------------------------------------------------------
+
+PC = function(n, p, Sigma, t0 = 2, tau = seq(0.1, 3.1, 0.01), alpha = c(0.05, 0.1, 0.15, 0.2), q = c(0.001, 0.01, 0.05, 0.1), c0, smax = n / 2, R = 1000){
+#- Signal recovery for partial correlations; tau is thresholding parameter; alpha is the FDR control level; q is the FPR control level; R is the number of repetitions; smax is the maximum number of non-zero element in lasso estimation (except diagonal); 
+lentau = length(tau)
+lenq = length(q)
+lenalpha = length(alpha)
+resultprop = matrix(0, R, 4 * lentau + 1); resultLiu = matrix(0, R, 4 * lentau + 1); resultLSW = matrix(0, R, 4 * lentau + 1); resultGL = matrix(0, R, 4 * lentau + 1)
+resultpropC0 = matrix(0, R, 4 * lentau + 1); resultLiuC0 = matrix(0, R, 4 * lentau + 1)
+FDPresultprop = matrix(0, R, 3 * lenalpha); FDPresultLiu = matrix(0, R, 3 * lenalpha)
+FDPresultpropC0 = matrix(0, R, 3 * lenalpha); FDPresultLiuC0 = matrix(0, R, 3 * lenalpha)
+
+precisionMatrix = solve(Sigma)
+IndMatrix = matrix(1, p, p) - diag(rep(1, p))
+STrue = 1 * (abs(precisionMatrix) > 10^(-3)); NoNSTrue = 1 * (STrue == 0)
+STrueNum = sum(STrue) - p
+
+pc0 = solve(Sigma)
+pcMatrix = diag(sqrt(1 / diag(pc0))) %*% pc0 %*% diag(sqrt(1 / diag(pc0)))
+STrueC0 = 1 * (abs(pcMatrix) > c0); NoNSTrueC0 = 1 * (STrueC0 == 0)
+STrueNumC0 = sum(STrueC0) - p
+
+for (rep in 1 : R){
+	X = mvrnorm(n, rep(0, p), Sigma)
+	Eresidual = matrix(0, n, p)
+	CoefMatrix = matrix(0, p, p - 1)
+	meanX = colMeans(X)
+	X = t(t(X) - meanX)
+	XS = matrix(0, n, p)
+	for (i in 1 : p){
+		XS[, i] = X[, i] / sd(X[, i])
+	}
+      for (i in 1 : p){
+		#out = genlasso(X[, i], X = X[, -i], D = diag(1, p - 1))
+      	#Coef = coef(out,  lambda = sqrt(2 * var(X[, i]) * n * log(p * log(p) / sqrt(n))))
+      	#Predict = predict(out, lambda = sqrt(2 * var(X[, i]) * n * log(p * log(p) / sqrt(n))), Xnew = X[, -i])
+		#CoefMatrix[i, ] = t(Coef$beta)
+		#Eresidual[, i] = X[, i] - Predict$fit
+
+		out = scalreg(X = XS[, -i], y = X[, i], lam0 = sqrt(2 * 2.01 * log(p * (log(p))^(1.5) / sqrt(n)) / n))
+		Eresidual[, i] = out$residuals
+		CoefMatrix[i, ] = out$coefficients / apply(X[, -i], 2, sd)
+		if ( sum(abs(CoefMatrix[i, ]) > 10^(-6)) > smax ){
+			out = genlasso(X[, i], X = XS[, -i], D = diag(1, p - 1))
+      		Coef = coef(out,  lambda = 2 * sqrt(var(X[, i]) * n * log(p)))
+      		Predict = predict(out, lambda = 2 * sqrt(var(X[, i]) * n * log(p)), Xnew = XS[, -i])
+			CoefMatrix[i, ] = t(Coef$beta) / apply(X[, -i], 2, sd)
+			Eresidual[, i] = X[, i] - Predict$fit
+		}
+
+      	#out = lars(X[, -i], X[, i], type = "lasso", intercept = FALSE)
+		#outCV = cv.lars(X[, -i], X[, i], plot.it = FALSE, type = "lasso", intercept = FALSE)
+		#IndexCV = outCV$index[order(outCV$cv)[1]]
+      	#Coef = predict(out, X[, -i], s = 2 * sqrt(var(X[, i]) * log(p) / n), type = "coefficients", mode = "lambda")$coefficients
+      	#Predict = predict(out, X[, -i], s = 2 * sqrt(var(X[, i]) * log(p) / n), type = "fit", mode = "lambda")
+      	#Coef = predict(out, X[, -i], s = IndexCV, type = "coefficients", mode = "fraction")$coefficients
+      	#Predict = predict(out, X[, -i], s = IndexCV, type = "fit", mode = "fraction")
+      	#CoefMatrix[i, ] = t(Coef)
+      	#Eresidual[, i] = X[, i] - Predict$fit
+      }
+	
+      CovRes = t(Eresidual) %*% Eresidual / n
+	Est = matrix(1, p, p)
+
+      for (i in 1 : (p - 1)){
+            for (j in (i + 1) : p){
+                  temp = Eresidual[, i] * Eresidual[, j] + Eresidual[, i]^2 * CoefMatrix[j, i] + Eresidual[, j]^2 * CoefMatrix[i, j - 1]
+                  Est[i, j] = mean(temp) / sqrt(diag(CovRes)[i] * diag(CovRes)[j])
+                  Est[j, i] = Est[i, j]
+            }
+      }
+
+	EstThresh = Est * ( abs(Est) >= (t0 * sqrt(log(p) / n) * IndMatrix) )
+
+	kappa = (n / 3) * mean( colSums(Eresidual^4) / (colSums(Eresidual^2))^2 )
+	CovX = t(X) %*% X / n - matrix(colMeans(X), p, 1) %*% matrix(colMeans(X), 1, p)
+
+	GL0 = glassopath(CovX, trace = 0)
+	rho0 = GL0$rholist
+	indexGL = c()
+	for (i in 1 : length(rho0)){
+		precision0 = GL0$wi[, , i]
+		indexGL = c(indexGL, sum(precision0 != 0))
+	}
+	if (length(indexGL <= p) > 0) {rhomax = min(rho0[indexGL <= p])}
+	if (length(indexGL <= p) == 0) {rhomax = max(rho0)}
+	rho = seq(rho0[1], rhomax, length.out = lentau)
+	GL = glassopath(CovX, rholist = rho, trace = 0)
+
+	resprop = c(); resLiu = c(); resLSW = c(); resGL = c()
+	rejectprop = c(); rejectLiu = c(); rejectLSW = c()
+	respropC0 = c(); resLiuC0 = c()
+	rejectpropC0 = c(); rejectLiuC0 = c()
+	for (i in 1 : lentau){
+		Threshold = tau[i] * sqrt(kappa * log(p) / n) * (1 - EstThresh^2)
+		SRec = 1 * (abs(Est) > Threshold); NoNSRec = 1 * (SRec == 0)
+		TruePositive = sum(SRec * STrue) - p; FasleNegative = sum(NoNSRec * STrue); FalsePositive = sum(SRec * NoNSTrue); TrueNegative = sum(NoNSRec * NoNSTrue)
+		tempprop = c(FalsePositive, FasleNegative, TruePositive, TrueNegative)
+		rejectprop = c(rejectprop, max(1, (sum(SRec) - p)))
+		resprop = c(resprop, tempprop)
+		SRecC0 = 1 * (abs(Est) - c0 > Threshold); NoNSRecC0 = 1 * (SRecC0 == 0)
+		TruePositiveC0 = sum(SRecC0 * STrueC0) - p; FasleNegativeC0 = sum(NoNSRecC0 * STrueC0); FalsePositiveC0 = sum(SRecC0 * NoNSTrueC0); TrueNegativeC0 = sum(NoNSRecC0 * NoNSTrueC0)
+		temppropC0 = c(FalsePositiveC0, FasleNegativeC0, TruePositiveC0, TrueNegativeC0)
+		rejectpropC0 = c(rejectpropC0, max(1, (sum(SRecC0) - p)))
+		respropC0 = c(respropC0, temppropC0)
+
+		ThresholdLiu = tau[i] * sqrt(log(p) / n) * IndMatrix
+		SRecLiu = 1 * (abs(Est) > ThresholdLiu); NoNSRecLiu = 1 * (SRecLiu == 0)
+		TruePositiveLiu = sum(SRecLiu * STrue) - p; FasleNegativeLiu = sum(NoNSRecLiu * STrue); FalsePositiveLiu = sum(SRecLiu * NoNSTrue); TrueNegativeLiu = sum(NoNSRecLiu * NoNSTrue)
+		tempLiu = c(FalsePositiveLiu, FasleNegativeLiu, TruePositiveLiu, TrueNegativeLiu)
+		rejectLiu = c(rejectLiu, max(1, (sum(SRecLiu) - p)))
+		resLiu = c(resLiu, tempLiu)
+		SRecLiuC0 = 1 * (abs(Est) - c0 > ThresholdLiu); NoNSRecLiuC0 = 1 * (SRecLiuC0 == 0)
+		TruePositiveLiuC0 = sum(SRecLiuC0 * STrueC0) - p; FasleNegativeLiuC0 = sum(NoNSRecLiuC0 * STrueC0); FalsePositiveLiuC0 = sum(SRecLiuC0 * NoNSTrueC0); TrueNegativeLiuC0 = sum(NoNSRecLiuC0 * NoNSTrueC0)
+		tempLiuC0 = c(FalsePositiveLiuC0, FasleNegativeLiuC0, TruePositiveLiuC0, TrueNegativeLiuC0)
+		rejectLiuC0 = c(rejectLiuC0, max(1, (sum(SRecLiuC0) - p)))
+		resLiuC0 = c(resLiuC0, tempLiuC0)
+
+		ThresholdLSW = tau[i] * sqrt(log(p) / n) * IndMatrix
+		SRecLSW = 1 * (abs(CovX) > ThresholdLSW); NoNSRecLSW = 1 * (SRecLSW == 0)
+		TruePositiveLSW = sum(SRecLSW * STrue) - p; FasleNegativeLSW = sum(NoNSRecLSW * STrue); FalsePositiveLSW = sum(SRecLSW * NoNSTrue); TrueNegativeLSW = sum(NoNSRecLSW * NoNSTrue)
+		tempLSW = c(FalsePositiveLSW, FasleNegativeLSW, TruePositiveLSW, TrueNegativeLSW)
+		rejectLSW = c(rejectLSW, max(1, (sum(SRecLSW) - p)))
+		resLSW = c(resLSW, tempLSW)
+
+		SRecGL = 1 * (GL$wi[, , i] != 0); NoNSRecGL = 1 * (GL$wi[, , i] == 0)
+		TruePositiveGL = sum(SRecGL * STrue) - p; FasleNegativeGL = sum(NoNSRecGL * STrue); FalsePositiveGL = sum(SRecGL * NoNSTrue); TrueNegativeGL = sum(NoNSRecGL * NoNSTrue)
+		tempGL = c(FalsePositiveGL, FasleNegativeGL, TruePositiveGL, TrueNegativeGL)
+		resGL = c(resGL, tempGL)
+	}
+
+	resultprop[rep, ] = c(STrueNum, resprop)
+	resultLiu[rep, ] = c(STrueNum, resLiu)
+	resultLSW[rep, ] = c(STrueNum, resLSW)
+	resultGL[rep, ] = c(STrueNum, resGL)
+	resultpropC0[rep, ] = c(STrueNumC0, respropC0)
+	resultLiuC0[rep, ] = c(STrueNumC0, resLiuC0)
+
+	FDPprop = 2 * p * (p - 1) * ( 1 - pnorm( tau * sqrt(log(p)) ) ) / rejectprop
+	FDPLiu = 2 * p * (p - 1) * ( 1 - pnorm( tau * sqrt(log(p)) ) ) / rejectLiu
+	FDPresprop = c(); FDPresLiu = c()
+	for (i in 1 : lenalpha){
+		if (sum(FDPprop <= alpha[i]) > 0) tauprop = min(c(2, tau[FDPprop <= alpha[i]]))
+		else tauprop = 2
+		Threshold = tauprop * sqrt(kappa * log(p) / n) * (1 - EstThresh^2)
+		SRec = 1 * (abs(Est) > Threshold); NoNSRec = 1 * (SRec == 0)
+		TruePositive = sum(SRec * STrue) - p; FalsePositive = sum(SRec * NoNSTrue)
+		powerprop = TruePositive / STrueNum
+		FDPalphaprop = FalsePositive / max(1, (sum(SRec) - p))
+		tempFDPprop = c(tauprop, FDPalphaprop, powerprop)
+		FDPresprop = c(FDPresprop, tempFDPprop)
+
+		if (sum(FDPLiu <= alpha[i]) > 0) tauLiu = min(c(2, tau[FDPLiu <= alpha[i]]))
+		else tauLiu = 2
+		ThresholdLiu = tauLiu * sqrt(log(p) / n) * IndMatrix
+		SRecLiu = 1 * (abs(Est) > ThresholdLiu); NoNSRecLiu = 1 * (SRecLiu == 0)
+		TruePositiveLiu = sum(SRecLiu * STrue) - p; FalsePositiveLiu = sum(SRecLiu * NoNSTrue)
+		powerLiu = TruePositiveLiu / STrueNum
+		FDPalphaLiu = FalsePositiveLiu / max(1, (sum(SRecLiu) - p))
+		tempFDPLiu = c(tauLiu, FDPalphaLiu, powerLiu)
+		FDPresLiu = c(FDPresLiu, tempFDPLiu)
+	}
+
+	FDPresultprop[rep, ] = FDPresprop
+	FDPresultLiu[rep, ] = FDPresLiu
+
+	FDPpropC0 = 2 * ( sqrt(n) * p * ( 1 - pnorm( tau * sqrt(log(p)) ) ) + p * (p - 1 - sqrt(n)) * ( 1 - pnorm( sqrt(n) * c0 / sqrt(kappa) + tau * sqrt(log(p)) ) ) ) / rejectpropC0
+	FDPLiuC0 = 2 * p * (p - 1) * ( 1 - pnorm( tau * sqrt(log(p)) ) ) / rejectLiuC0
+	FDPrespropC0 = c(); FDPresLiuC0 = c()
+	for (i in 1 : lenalpha){
+		if (sum(FDPpropC0 <= alpha[i]) > 0) taupropC0 = min(c(2, tau[FDPpropC0 <= alpha[i]]))
+		else taupropC0 = 2
+		ThresholdC0 = taupropC0 * sqrt(kappa * log(p) / n) * (1 - EstThresh^2)
+		SRecC0 = 1 * (abs(Est) - c0 > ThresholdC0); NoNSRecC0 = 1 * (SRecC0 == 0)
+		TruePositiveC0 = sum(SRecC0 * STrueC0) - p; FalsePositiveC0 = sum(SRecC0 * NoNSTrueC0)
+		powerpropC0 = TruePositiveC0 / STrueNumC0
+		FDPalphapropC0 = FalsePositiveC0 / max(1, (sum(SRecC0) - p))
+		tempFDPpropC0 = c(taupropC0, FDPalphapropC0, powerpropC0)
+		FDPrespropC0 = c(FDPrespropC0, tempFDPpropC0)
+
+		if (sum(FDPLiuC0 <= alpha[i]) > 0) tauLiuC0 = min(c(2, tau[FDPLiuC0 <= alpha[i]]))
+		else tauLiuC0 = 2
+		ThresholdLiuC0 = tauLiuC0 * sqrt(log(p) / n) * IndMatrix
+		SRecLiuC0 = 1 * (abs(Est) - c0 > ThresholdLiuC0); NoNSRecLiuC0 = 1 * (SRecLiuC0 == 0)
+		TruePositiveLiuC0 = sum(SRecLiuC0 * STrueC0) - p; FalsePositiveLiuC0 = sum(SRecLiuC0 * NoNSTrueC0)
+		powerLiuC0 = TruePositiveLiuC0 / STrueNumC0
+		FDPalphaLiuC0 = FalsePositiveLiuC0 / max(1, (sum(SRecLiuC0) - p))
+		tempFDPLiuC0 = c(tauLiuC0, FDPalphaLiuC0, powerLiuC0)
+		FDPresLiuC0 = c(FDPresLiuC0, tempFDPLiuC0)
+	}
+
+	FDPresultpropC0[rep, ] = FDPrespropC0
+	FDPresultLiuC0[rep, ] = FDPresLiuC0
+
+        cat("iteration = ", c(rep, FDPresprop[c(5, 6)], FDPresLiu[c(5, 6)], FDPrespropC0[c(5, 6)], FDPresLiuC0[c(5, 6)]), "\n")
+}
+return(list(resultprop, resultLiu, resultLSW, resultGL, FDPresultprop, FDPresultLiu, FDPresultpropC0, FDPresultLiuC0, resultpropC0, resultLiuC0))
+}
+
