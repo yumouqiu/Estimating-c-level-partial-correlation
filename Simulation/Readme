@@ -1,0 +1,4 @@
+"PartialCorrelation1.txt" contain the R functions for the simulation study;
+"BD.R" is the main code for simulation structure A;
+"plot.R" summarizes the results from "BD.R" to produce Figure 2 and Table 1;
+"reportC0.R" summarizes the results from "BD.R" to produce Table 2.
